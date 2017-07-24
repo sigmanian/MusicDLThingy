@@ -1,0 +1,335 @@
+from bs4 import BeautifulSoup
+from mutagen.easyid3 import EasyID3
+import requests
+import pafy
+import os
+import os.path
+from pydub import AudioSegment
+
+ARTIST_NAMES_TEXT_FILE = 'ArtistNames.txt'
+COMPLETED_SONGS_TEXT_FILE_NAME = 'CompletedSongs.txt'
+REDUNDANT_WORDS = ['feat']
+JOINING_WORDS = ['&']
+INPUT_SEPARATORS = [',', '0']
+
+
+def get_kfm_song_names():
+    page_source = requests.get('http://www.kfm.co.za/')
+    soup = BeautifulSoup(page_source.text, 'html.parser')
+
+    recently_played = soup.find(class_='items-list items-list__recently-played')
+    recently_played_soup = BeautifulSoup(str(recently_played), 'html.parser')
+
+    kfm_current_song_names = []
+    for song_info in recently_played_soup.find_all(class_="items-list-text"):
+        s = song_info.text
+        s = s.replace('\n', ' ')
+        s = s[1:-1]
+        kfm_current_song_names.append(str(s))
+    return kfm_current_song_names
+
+
+def read_songs_names():
+    f = open(COMPLETED_SONGS_TEXT_FILE_NAME, 'r')
+
+    completed_song_names = []
+    for line in f:
+        completed_song_names.append(line.replace('\n', ''))
+    f.close()
+
+    return completed_song_names
+
+
+def read_artist_names():
+    f = open(ARTIST_NAMES_TEXT_FILE, 'r')
+
+    p_artist_names = []
+    for line in f:
+        p_artist_names.append(line.replace('\n', ''))
+    f.close()
+
+    return p_artist_names
+
+
+def write_songs_names(songs_names):
+    f = open(COMPLETED_SONGS_TEXT_FILE_NAME, 'w')
+    for line in songs_names:
+        f.write(line + '\n')
+    f.close()
+
+
+def delete_excess_stuff(p_lower_song_names):
+    clean_songs = []
+    for single_song in p_lower_song_names:
+        single_song_name = ''
+        for split_word in single_song.split():
+
+            clean_word = ''
+            for letter in split_word:
+                if letter in 'abcdefghijklmnopqrstuvwxyz&1234567890':
+                    clean_word = clean_word+letter
+
+            if len(clean_word) is 0:
+                continue
+
+            single_song_name = single_song_name+' '+clean_word
+        single_song_name = single_song_name.replace('radio edit', '')
+        single_song_name = single_song_name.replace('feat', '&')
+        clean_songs.append(single_song_name.strip())
+
+    return clean_songs
+
+
+def clean_up_raw_songs(p_raw_song_names):
+    song_names_lower = []
+    for p_k in p_raw_song_names:
+        p_k = p_k.lower()
+        p_k = p_k.strip()
+        song_names_lower.append(p_k)
+
+    song_names_clean = delete_excess_stuff(song_names_lower)
+
+    return song_names_clean
+
+
+def find_artist_names(p_song_class):
+    p_raw_song_name = p_song_class.raw_song_name
+    for p_k in range(0, len(p_song_class.artists)):
+        p_raw_song_name = p_raw_song_name.replace(p_song_class.artists[p_k], '')
+
+    p_raw_song_name = " ".join(p_raw_song_name.split())
+    raw_artist_names_pos = ''
+
+    while raw_artist_names_pos is '':
+        print('\n\n'+p_raw_song_name.strip())
+        raw_artist_names_pos = input('Where are the ARTIST NAMES?\n')
+
+    if raw_artist_names_pos is '0':
+        return p_song_class.artists
+
+    artist_names_pos = []
+    for separator in INPUT_SEPARATORS:
+        if separator in raw_artist_names_pos:
+            artist_names_pos = raw_artist_names_pos.split(separator)
+            break
+
+    if len(artist_names_pos) is 0:
+        artist_names_pos = [raw_artist_names_pos]
+
+    raw_song_name_split = p_raw_song_name.split()
+
+    for artist_pos in artist_names_pos:
+        p_artist_name_build = ''
+        for artist_pos_number in artist_pos:
+            p_artist_name_build = p_artist_name_build+' '+raw_song_name_split[int(artist_pos_number)-1]
+        p_song_class.artists.append(p_artist_name_build.strip())
+
+    return p_song_class.artists
+
+
+def get_title(p_song_class):
+    p_song_class.title = p_song_class.raw_song_name
+    for p_artist in p_song_class.artists:
+        p_song_class.title = p_song_class.title.replace(p_artist, '')
+
+    for p_joining_word in JOINING_WORDS:
+        p_song_class.title = p_song_class.title.replace(p_joining_word, '')
+
+    p_song_class.title = p_song_class.title.strip()
+
+    return p_song_class.title
+
+
+def get_youtube_result_objects(p_song_name):
+    result_objects = []
+    song_url = 'https://www.youtube.com/results?search_query='+p_song_name.replace(' ', '+')+'+audio'
+    result_page = requests.get(song_url)
+    browser = BeautifulSoup(result_page.text, "html.parser")
+
+    failed_counter = 0
+    soup_title_result = browser.find_all('h3', class_="yt-lockup-title")
+    soup_views_result = browser.find_all(class_="yt-lockup-meta-info")
+    while len(result_objects) < 3:
+
+        if len(result_objects)+failed_counter > 15:
+            continue
+
+        link = str(soup_title_result[len(result_objects)+failed_counter])
+        if (link.find('/watch') < 0) or (link.find(' - Playlist') > -1):
+            failed_counter += 1
+            continue
+
+        link = link[link.find("/watch") + 9:]
+        link = link[:link.find("\"")]
+        link = 'https://www.youtube.com/watch?v=' + link
+
+        new_result_obj = YoutubeResultObject(link)
+
+        title = str(soup_title_result[len(result_objects)+failed_counter])
+        title = title[title.find('title="')+7:]
+        title = title[:title.find('"')]
+        new_result_obj.title = title
+
+        views = str(soup_views_result[len(result_objects)+failed_counter])
+
+        if views.find('</li><li>') < 0:
+            failed_counter += 1
+            continue
+
+        views = views[views.find('</li><li>')+9:]
+        views = views[:views.find(' views')]
+        views = views.replace(',', '')
+
+        new_result_obj.views = int(views)
+
+        result_objects.append(new_result_obj)
+
+    return result_objects
+
+
+def does_match(p_original, p_new):
+    p_counter = 0
+    p_original_split = p_original.split()
+    p_new_split = p_new.split()
+
+    for p_original_word in p_original_split:
+        if p_original_word in p_new_split:
+            p_counter += 1
+
+    if p_counter / len(p_original_split) >= 0.7:
+        return True
+    else:
+        return False
+
+
+def get_max_views(p_objects, p_excluding):
+    max_view_index = 0
+    for p_k in range(0, len(p_objects)):
+        if p_objects[p_k] is p_excluding:
+            continue
+
+        if p_objects[p_k].views > p_objects[max_view_index].views:
+            max_view_index = p_k
+
+    return p_objects[max_view_index]
+
+
+def convert_to_mp3(p_file_name):
+    path = os.getcwd()
+
+    m4a_audio = AudioSegment.from_file(path+'\Songs\\'+p_file_name, format="m4a")
+    m4a_audio.export(path+'\Songs-MP3\\'+'%s.mp3' % p_file_name[:-4], format='mp3')
+
+
+class SongClass:
+
+    def __init__(self, raw_name):
+        self.raw_song_name = raw_name
+        self.title = ''
+        self.artists = []
+        self.is_new = True
+
+
+class YoutubeResultObject:
+
+    def __init__(self, video_link):
+        self.link = video_link
+        self.views = ''
+        self.title = ''
+
+
+# begins here----------------------------------------------------
+already_downloaded_songs = read_songs_names()
+artist_names = read_artist_names()
+raw_current_songs = get_kfm_song_names()  # append songs here if more stations are added
+
+current_songs_clean = clean_up_raw_songs(raw_current_songs)
+song_class_array = []
+
+for x in current_songs_clean:
+    song_class_array.append(SongClass(x))
+
+for current_song_class in song_class_array:
+    test_name = current_song_class.raw_song_name
+    for current_artist_name in artist_names:
+        if len(test_name.split()) is not len(test_name.replace(current_artist_name, '').split()):
+            test_name = test_name.replace(current_artist_name, '')
+            current_song_class.artists.append(current_artist_name)
+
+    if len(current_song_class.artists) is 0:
+        current_song_class.artists = find_artist_names(current_song_class)
+
+    if len(current_song_class.artists) < (current_song_class.raw_song_name.count('&')+1):
+        current_song_class.artists = find_artist_names(current_song_class)
+
+    if len(current_song_class.artists) is 0:
+        print('NO ARTISTS FOUND IN SONG NAME!!!')
+        continue
+
+    current_song_class.title = get_title(current_song_class)
+
+    print_string = current_song_class.title + ' By: '
+    for k in current_song_class.artists:
+        print_string = print_string + k + ', '
+
+    if current_song_class.title in already_downloaded_songs:
+        print_string = '\n\nOld Song '+print_string
+        print_string = print_string[0:-2]
+        print(print_string)
+
+        continue
+
+    print('\nDownloading: '+print_string)
+
+    Youtube_result_objects = get_youtube_result_objects(current_song_class.raw_song_name)
+
+    for current_youtube_result_object in Youtube_result_objects:
+        if not(does_match(current_song_class.title, current_youtube_result_object.title.lower())):
+            Youtube_result_objects.remove(current_youtube_result_object)
+
+    max_views_object = get_max_views(Youtube_result_objects, Youtube_result_objects[0])
+    next_max_view_object = get_max_views(Youtube_result_objects, max_views_object)
+
+    video = pafy.new(max_views_object.link)
+
+    if video.length > 360:
+        print("-too long-")
+        video = pafy.new(next_max_view_object.link)
+        if video.length > 360:
+            print('-Still too long-')
+            continue
+
+    best_audio = video.getbestaudio(preftype="m4a")
+    try:
+        song_name_final = ''
+        for artist in current_song_class.artists:
+            song_name_final = song_name_final+artist+'&'
+
+            current_song_class.title = " ".join(current_song_class.title.split())
+        song_name_final = song_name_final[:-1]+' - '+current_song_class.title.capitalize()
+
+        best_audio.download(filepath=r"Songs\\"+song_name_final+'.'+best_audio.extension, quiet=False)
+    except FileExistsError:
+        print("File Already Exists")
+        continue
+
+    convert_to_mp3(song_name_final+'.'+best_audio.extension)
+
+    audio = EasyID3('Songs-MP3\\'+song_name_final+'.mp3')
+
+    to_write = current_song_class.title.capitalize()
+    audio["title"] = to_write  # .decode('utf-8')
+    to_write = current_song_class.artists[0]
+    audio["artist"] = to_write  # .decode('utf-8')
+
+    audio.save(v2_version=3)
+
+    file_object = open('CompletedSongs.txt', 'a')
+    file_object.write(current_song_class.title+'\n')
+    file_object.close()
+
+    file_object = open('ArtistNames.txt', 'a')
+    for c in current_song_class.artists:
+        if current_song_class.artists not in artist_names:
+            file_object.write(c+'\n')
+    file_object.close()
